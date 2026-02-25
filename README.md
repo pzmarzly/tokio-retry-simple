@@ -1,5 +1,7 @@
 # tokio_retry_simple
 
+**WARNING: This is just an AI experiment. For real-world use, consider using [`backon`](https://crates.io/crates/backon).**
+
 `tokio_retry` but simple.
 
 No strategy objects, no iterator-based delay generators, no traits. Just pass your
