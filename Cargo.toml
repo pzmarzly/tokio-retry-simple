@@ -1,6 +1,10 @@
 [package]
-name = "tokio_retry3"
+name = "tokio_retry_simple"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+tokio = { version = "1", features = ["time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["time", "test-util", "macros", "rt", "rt-multi-thread"] }
