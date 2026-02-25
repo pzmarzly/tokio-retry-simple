@@ -18,35 +18,37 @@ async fn main() {
     let result = retry(&[500, 1000, 2000], || async {
         flaky_request().await.map_err(RetryError::Transient)
     })
-    .before_all(|| {
-        println!("--- starting flaky_request with up to 4 attempts ---");
+    .before_all(|info| {
+        println!("--- starting flaky_request (attempt {}) ---", info.attempt);
     })
     .before_attempt(|info| {
-        print!("[attempt {}] firing", info.attempt);
-        if let Some(delay) = info.next_delay {
-            println!(" (will wait {delay:?} on failure)");
-        } else {
-            println!(" (last chance)");
-        }
+        println!(
+            "[attempt {}] firing (elapsed: {:?})",
+            info.attempt, info.total_elapsed
+        );
     })
     .after_attempt(|info| {
-        if let Some(delay) = info.next_delay {
+        if info.success {
+            println!("[attempt {}] succeeded!", info.attempt);
+        } else if let Some(delay) = info.next_delay {
             println!("[attempt {}] failed, sleeping {delay:?}...", info.attempt);
         } else {
-            println!(
-                "[attempt {}] done (elapsed: {:?})",
-                info.attempt, info.total_elapsed
-            );
+            println!("[attempt {}] failed (no retries left)", info.attempt);
         }
     })
-    .after_all(|| {
-        println!("--- finished ---");
+    .after_all(|info| {
+        println!(
+            "--- finished: {} after {} attempt(s), took {:?} ---",
+            if info.success { "success" } else { "failure" },
+            info.attempt,
+            info.total_elapsed
+        );
     })
     .call()
     .await;
 
     match result {
-        Ok(val) => println!("success: {val}"),
+        Ok(val) => println!("result: {val}"),
         Err(e) => println!("gave up: {e}"),
     }
 }

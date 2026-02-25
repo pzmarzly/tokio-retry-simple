@@ -57,10 +57,10 @@ Four optional hooks for logging or metrics:
 
 | Hook | Called | Receives |
 |------|--------|----------|
-| `before_all` | Once, before the first attempt | nothing |
-| `before_attempt` | Before each attempt | `BeforeAttemptInfo` |
-| `after_attempt` | After each attempt | `AfterAttemptInfo` |
-| `after_all` | Once, after the last attempt | nothing |
+| `before_all` | Once, before the first attempt | `&BeforeAttemptInfo` |
+| `before_attempt` | Before each attempt | `&BeforeAttemptInfo` |
+| `after_attempt` | After each attempt | `&AfterAttemptInfo` |
+| `after_all` | Once, after the last attempt | `&AfterAttemptInfo` |
 
 ```rust
 use tokio_retry_simple::{retry, RetryError};
@@ -68,25 +68,28 @@ use tokio_retry_simple::{retry, RetryError};
 let result = retry(&[1000, 2000], || async {
     fetch_data().await.map_err(RetryError::Transient)
 })
-.before_all(|| println!("starting request"))
+.before_all(|_info| println!("starting request"))
 .before_attempt(|info| {
     println!("attempt {} (elapsed: {:?})", info.attempt, info.total_elapsed);
 })
 .after_attempt(|info| {
-    if let Some(delay) = info.next_delay {
+    if info.success {
+        println!("  succeeded!");
+    } else if let Some(delay) = info.next_delay {
         println!("  failed, retrying in {:?}", delay);
     }
 })
-.after_all(|| println!("done"))
+.after_all(|info| {
+    println!("done: success={}, attempts={}", info.success, info.attempt);
+})
 .call()
 .await;
 ```
 
-`BeforeAttemptInfo` and `AfterAttemptInfo` both carry `attempt`, `next_delay`, and
-`total_elapsed`. The difference is in `next_delay` semantics:
+**`BeforeAttemptInfo`** — `attempt` (1-based) + `total_elapsed`.
 
-- **before**: the delay that *will* be slept if this attempt fails (`None` on last attempt)
-- **after**: the delay *about to* be slept (`None` if succeeded, permanent, or exhausted)
+**`AfterAttemptInfo`** — `attempt` + `success` + `next_delay` + `total_elapsed`.
+`next_delay` is `Some` when a transient failure will be retried, `None` otherwise.
 
 ## `.call()` vs `.await`
 

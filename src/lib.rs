@@ -26,14 +26,14 @@
 //! let val = retry(&[1000, 2000], || async {
 //!     do_request().await.map_err(RetryError::Transient)
 //! })
-//! .before_all(|| println!("starting"))
+//! .before_all(|info| println!("starting (attempt {})", info.attempt))
 //! .before_attempt(|info| println!("attempt {}", info.attempt))
 //! .after_attempt(|info| {
 //!     if let Some(d) = info.next_delay {
 //!         println!("  retrying in {d:?}");
 //!     }
 //! })
-//! .after_all(|| println!("done"))
+//! .after_all(|info| println!("done after {} attempts, success={}", info.attempt, info.success))
 //! .call()
 //! .await?;
 //! # Ok(())
@@ -92,25 +92,30 @@ impl<E: fmt::Display> fmt::Display for RetryError<E> {
 
 impl<E: fmt::Display + fmt::Debug> std::error::Error for RetryError<E> {}
 
-/// Metadata passed to [`Retry::before_attempt`] hooks.
+/// Metadata passed to [`Retry::before_attempt`] and [`Retry::before_all`] hooks.
+///
+/// In `before_all`, `attempt` is always 1 (about to start the first attempt).
 #[derive(Debug, Clone)]
 pub struct BeforeAttemptInfo {
-    /// Current attempt number, 1-based.
+    /// Current attempt number, 1-based. Always 1 in `before_all`.
     pub attempt: u32,
-    /// The delay that will be slept if this attempt fails. `None` on the final
-    /// attempt (no more retries available).
-    pub next_delay: Option<Duration>,
     /// Wall-clock time since the retry loop started.
     pub total_elapsed: Duration,
 }
 
-/// Metadata passed to [`Retry::after_attempt`] hooks.
+/// Metadata passed to [`Retry::after_attempt`] and [`Retry::after_all`] hooks.
+///
+/// In `after_all`, `attempt` is the total number of attempts made and
+/// `next_delay` is always `None`.
 #[derive(Debug, Clone)]
 pub struct AfterAttemptInfo {
-    /// Current attempt number, 1-based.
+    /// Current attempt number, 1-based. In `after_all`, equals total attempts made.
     pub attempt: u32,
+    /// Whether this attempt (or the overall retry loop, in `after_all`) succeeded.
+    pub success: bool,
     /// The delay about to be slept before the next attempt. `None` when the
     /// attempt succeeded, hit a permanent error, or retries are exhausted.
+    /// Always `None` in `after_all`.
     pub next_delay: Option<Duration>,
     /// Wall-clock time since the retry loop started.
     pub total_elapsed: Duration,
@@ -121,8 +126,8 @@ pub struct AfterAttemptInfo {
 pub struct Retry<F> {
     delays: Vec<Duration>,
     operation: F,
-    before_all: Box<dyn FnMut()>,
-    after_all: Box<dyn FnMut()>,
+    before_all: Box<dyn FnMut(&BeforeAttemptInfo)>,
+    after_all: Box<dyn FnMut(&AfterAttemptInfo)>,
     before_attempt: Box<dyn FnMut(&BeforeAttemptInfo)>,
     after_attempt: Box<dyn FnMut(&AfterAttemptInfo)>,
 }
@@ -149,22 +154,24 @@ pub fn retry<F>(delays: &[u64], operation: F) -> Retry<F> {
     Retry {
         delays: delays.iter().map(|&ms| Duration::from_millis(ms)).collect(),
         operation,
-        before_all: Box::new(|| {}),
-        after_all: Box::new(|| {}),
+        before_all: Box::new(|_| {}),
+        after_all: Box::new(|_| {}),
         before_attempt: Box::new(|_| {}),
         after_attempt: Box::new(|_| {}),
     }
 }
 
 impl<F> Retry<F> {
-    /// Hook called once before the retry loop starts.
-    pub fn before_all(mut self, hook: impl FnMut() + 'static) -> Self {
+    /// Hook called once before the retry loop starts. Receives a
+    /// [`BeforeAttemptInfo`] with `attempt = 1`.
+    pub fn before_all(mut self, hook: impl FnMut(&BeforeAttemptInfo) + 'static) -> Self {
         self.before_all = Box::new(hook);
         self
     }
 
-    /// Hook called once after the retry loop ends (success or failure).
-    pub fn after_all(mut self, hook: impl FnMut() + 'static) -> Self {
+    /// Hook called once after the retry loop ends (success or failure). Receives
+    /// an [`AfterAttemptInfo`] with `attempt` = total attempts made.
+    pub fn after_all(mut self, hook: impl FnMut(&AfterAttemptInfo) + 'static) -> Self {
         self.after_all = Box::new(hook);
         self
     }
@@ -187,8 +194,8 @@ impl<F> Retry<F> {
         self
     }
 
-    /// Hook called after each attempt. `next_delay` is `Some` when a transient
-    /// failure is about to be retried, `None` otherwise.
+    /// Hook called after each attempt. Check `success` to see whether it worked,
+    /// and `next_delay` to see if a retry sleep is coming.
     pub fn after_attempt(mut self, hook: impl FnMut(&AfterAttemptInfo) + 'static) -> Self {
         self.after_attempt = Box::new(hook);
         self
@@ -206,9 +213,13 @@ where
     /// Prefer this over `.await` — it doesn't require `'static` bounds, so your
     /// closure can borrow from the surrounding scope.
     pub async fn call(mut self) -> Result<T, E> {
-        (self.before_all)();
-
         let start = Instant::now();
+
+        (self.before_all)(&BeforeAttemptInfo {
+            attempt: 1,
+            total_elapsed: start.elapsed(),
+        });
+
         let total_attempts = self.delays.len() + 1;
         let mut last_error: Option<E> = None;
 
@@ -218,32 +229,46 @@ where
 
             (self.before_attempt)(&BeforeAttemptInfo {
                 attempt,
-                next_delay: scheduled_delay,
                 total_elapsed: start.elapsed(),
             });
 
             match (self.operation)().await {
                 Ok(val) => {
+                    let elapsed = start.elapsed();
                     (self.after_attempt)(&AfterAttemptInfo {
                         attempt,
+                        success: true,
                         next_delay: None,
-                        total_elapsed: start.elapsed(),
+                        total_elapsed: elapsed,
                     });
-                    (self.after_all)();
+                    (self.after_all)(&AfterAttemptInfo {
+                        attempt,
+                        success: true,
+                        next_delay: None,
+                        total_elapsed: elapsed,
+                    });
                     return Ok(val);
                 }
                 Err(RetryError::Permanent(e)) => {
+                    let elapsed = start.elapsed();
                     (self.after_attempt)(&AfterAttemptInfo {
                         attempt,
+                        success: false,
                         next_delay: None,
-                        total_elapsed: start.elapsed(),
+                        total_elapsed: elapsed,
                     });
-                    (self.after_all)();
+                    (self.after_all)(&AfterAttemptInfo {
+                        attempt,
+                        success: false,
+                        next_delay: None,
+                        total_elapsed: elapsed,
+                    });
                     return Err(e);
                 }
                 Err(RetryError::Transient(e)) => {
                     (self.after_attempt)(&AfterAttemptInfo {
                         attempt,
+                        success: false,
                         next_delay: scheduled_delay,
                         total_elapsed: start.elapsed(),
                     });
@@ -252,14 +277,24 @@ where
                         last_error = Some(e);
                         tokio::time::sleep(delay).await;
                     } else {
-                        (self.after_all)();
+                        (self.after_all)(&AfterAttemptInfo {
+                            attempt,
+                            success: false,
+                            next_delay: None,
+                            total_elapsed: start.elapsed(),
+                        });
                         return Err(e);
                     }
                 }
             }
         }
 
-        (self.after_all)();
+        (self.after_all)(&AfterAttemptInfo {
+            attempt: total_attempts as u32,
+            success: false,
+            next_delay: None,
+            total_elapsed: start.elapsed(),
+        });
         Err(last_error.expect("at least one attempt must have been made"))
     }
 }
@@ -327,7 +362,7 @@ mod tests {
         .await;
 
         assert_eq!(result, Err("still broken"));
-        assert_eq!(count.get(), 3); // 2 delays + 1 = 3 attempts
+        assert_eq!(count.get(), 3);
     }
 
     #[tokio::test(start_paused = true)]
@@ -367,12 +402,12 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn hooks_receive_correct_info() {
-        let before_attempts = Rc::new(Cell::new(Vec::new()));
-        let after_attempts = Rc::new(Cell::new(Vec::new()));
+        let before_log = Rc::new(Cell::new(Vec::new()));
+        let after_log = Rc::new(Cell::new(Vec::new()));
         let count = Cell::new(0u32);
 
-        let ba = before_attempts.clone();
-        let aa = after_attempts.clone();
+        let bl = before_log.clone();
+        let al = after_log.clone();
         let _ = retry(&[100, 200], || {
             let attempt = count.get() + 1;
             count.set(attempt);
@@ -385,29 +420,26 @@ mod tests {
             }
         })
         .before_attempt(move |info| {
-            let mut v = ba.take();
-            v.push((info.attempt, info.next_delay));
-            ba.set(v);
+            let mut v = bl.take();
+            v.push(info.attempt);
+            bl.set(v);
         })
         .after_attempt(move |info| {
-            let mut v = aa.take();
-            v.push((info.attempt, info.next_delay));
-            aa.set(v);
+            let mut v = al.take();
+            v.push((info.attempt, info.success, info.next_delay));
+            al.set(v);
         })
         .call()
         .await;
 
-        let before = before_attempts.take();
-        assert_eq!(before.len(), 3);
-        assert_eq!(before[0], (1, Some(Duration::from_millis(100))));
-        assert_eq!(before[1], (2, Some(Duration::from_millis(200))));
-        assert_eq!(before[2], (3, None)); // last attempt, no delay
+        let before = before_log.take();
+        assert_eq!(before, vec![1, 2, 3]);
 
-        let after = after_attempts.take();
+        let after = after_log.take();
         assert_eq!(after.len(), 3);
-        assert_eq!(after[0], (1, Some(Duration::from_millis(100)))); // transient, will sleep 100ms
-        assert_eq!(after[1], (2, Some(Duration::from_millis(200)))); // transient, will sleep 200ms
-        assert_eq!(after[2], (3, None)); // succeeded, no delay
+        assert_eq!(after[0], (1, false, Some(Duration::from_millis(100))));
+        assert_eq!(after[1], (2, false, Some(Duration::from_millis(200))));
+        assert_eq!(after[2], (3, true, None));
     }
 
     #[tokio::test(start_paused = true)]
@@ -435,7 +467,7 @@ mod tests {
                 }
             }
         })
-        .before_all(move || {
+        .before_all(move |_| {
             let mut v = log_ball.take();
             v.push("before_all".to_string());
             log_ball.set(v);
@@ -450,7 +482,7 @@ mod tests {
             v.push(format!("after{}", info.attempt));
             log_aa.set(v);
         })
-        .after_all(move || {
+        .after_all(move |_| {
             let mut v = log_aall.take();
             v.push("after_all".to_string());
             log_aall.set(v);
@@ -519,74 +551,146 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn before_all_after_all_called_on_success() {
-        let log = Rc::new(Cell::new(Vec::<&str>::new()));
+        let log = Rc::new(Cell::new(Vec::new()));
 
         let l1 = log.clone();
         let l2 = log.clone();
         let _ = retry(&[100], || async { Ok::<_, RetryError<()>>(()) })
-            .before_all(move || {
+            .before_all(move |info| {
                 let mut v = l1.take();
-                v.push("before_all");
+                v.push(format!("before_all(attempt={})", info.attempt));
                 l1.set(v);
             })
-            .after_all(move || {
+            .after_all(move |info| {
                 let mut v = l2.take();
-                v.push("after_all");
+                v.push(format!(
+                    "after_all(attempt={},success={})",
+                    info.attempt, info.success
+                ));
                 l2.set(v);
             })
             .call()
             .await;
 
-        assert_eq!(log.take(), vec!["before_all", "after_all"]);
+        assert_eq!(
+            log.take(),
+            vec!["before_all(attempt=1)", "after_all(attempt=1,success=true)"]
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn before_all_after_all_called_on_permanent() {
-        let log = Rc::new(Cell::new(Vec::<&str>::new()));
+        let log = Rc::new(Cell::new(Vec::new()));
 
         let l1 = log.clone();
         let l2 = log.clone();
         let _: Result<(), &str> = retry(&[100], || async {
             Err(RetryError::Permanent("boom"))
         })
-        .before_all(move || {
+        .before_all(move |info| {
             let mut v = l1.take();
-            v.push("before_all");
+            v.push(format!("before_all(attempt={})", info.attempt));
             l1.set(v);
         })
-        .after_all(move || {
+        .after_all(move |info| {
             let mut v = l2.take();
-            v.push("after_all");
+            v.push(format!(
+                "after_all(attempt={},success={})",
+                info.attempt, info.success
+            ));
             l2.set(v);
         })
         .call()
         .await;
 
-        assert_eq!(log.take(), vec!["before_all", "after_all"]);
+        assert_eq!(
+            log.take(),
+            vec![
+                "before_all(attempt=1)",
+                "after_all(attempt=1,success=false)"
+            ]
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn before_all_after_all_called_on_exhaustion() {
-        let log = Rc::new(Cell::new(Vec::<&str>::new()));
+        let log = Rc::new(Cell::new(Vec::new()));
 
         let l1 = log.clone();
         let l2 = log.clone();
-        let _: Result<(), &str> = retry(&[], || async {
+        let _: Result<(), &str> = retry(&[100], || async {
             Err(RetryError::Transient("nope"))
         })
-        .before_all(move || {
+        .before_all(move |info| {
             let mut v = l1.take();
-            v.push("before_all");
+            v.push(format!("before_all(attempt={})", info.attempt));
             l1.set(v);
         })
-        .after_all(move || {
+        .after_all(move |info| {
             let mut v = l2.take();
-            v.push("after_all");
+            v.push(format!(
+                "after_all(attempt={},success={})",
+                info.attempt, info.success
+            ));
             l2.set(v);
         })
         .call()
         .await;
 
-        assert_eq!(log.take(), vec!["before_all", "after_all"]);
+        assert_eq!(
+            log.take(),
+            vec![
+                "before_all(attempt=1)",
+                "after_all(attempt=2,success=false)"
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn after_attempt_success_flag() {
+        let results = Rc::new(Cell::new(Vec::new()));
+        let count = Cell::new(0u32);
+
+        let r = results.clone();
+        let _ = retry(&[100], || {
+            let attempt = count.get() + 1;
+            count.set(attempt);
+            async move {
+                if attempt < 2 {
+                    Err::<(), _>(RetryError::Transient("err"))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .after_attempt(move |info| {
+            let mut v = r.take();
+            v.push((info.attempt, info.success));
+            r.set(v);
+        })
+        .call()
+        .await;
+
+        let r = results.take();
+        assert_eq!(r, vec![(1, false), (2, true)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn after_attempt_permanent_not_success() {
+        let results = Rc::new(Cell::new(Vec::new()));
+
+        let r = results.clone();
+        let _: Result<(), &str> = retry(&[100], || async {
+            Err(RetryError::Permanent("fatal"))
+        })
+        .after_attempt(move |info| {
+            let mut v = r.take();
+            v.push((info.attempt, info.success));
+            r.set(v);
+        })
+        .call()
+        .await;
+
+        assert_eq!(results.take(), vec![(1, false)]);
     }
 }
